@@ -3,12 +3,16 @@
 Separate from op.py because the two run in different places: op.py runs in the
 operator's own process for every message, while this runs distributed and rarely.
 
-provide_historic_data() is Operator Lib's reader over the platform's timeseries
-store. It returns Ray Datasets, so the training below never holds the whole
-history in one process.
+The model is a linear day-ahead forecaster over lagged hourly means of net grid
+power (see forecast.py for every feature and why none of them reads the hour being
+forecast). Training turns the raw ~10 s history into hourly means, fits the
+weights, reports an honest holdout on the newest four weeks of the history, and
+hands the operator the newest hourly means as a seed so it can forecast from its
+first message instead of waiting two weeks for its own lags.
 """
 
 import datetime
+import math
 import typing
 
 import ray
@@ -16,49 +20,70 @@ from mlflow.pyfunc import PythonModel
 
 from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
 
+import forecast
 
-# How much history one training pass reads.
-TRAINING_WINDOW = datetime.timedelta(days=90)
+
+# How much history one training pass reads. A year, so the lag weights see every
+# season; the weights themselves are few and do not overfit on it.
+TRAINING_WINDOW = datetime.timedelta(days=365)
 
 
 class OdeAblationLoadL2Model(PythonModel):
     """The model MLflow registers and op.py later loads.
 
-    predict() receives exactly the payload infer() builds, so the two are one
-    contract in two files. Keep it serialisable: MLflow stores this object.
+    It carries the fitted weights, the fallback level and the seed of hourly
+    means ending where training ended. predict() takes a target epoch hour and a
+    mapping of epoch hour to hourly mean; op.py calls forecast_hour() directly so
+    it can pass its own lookup without building a payload per hour.
     """
 
-    def __init__(self, baseline: float) -> None:
-        self.baseline = baseline
+    def __init__(self, weights: typing.List[float], fallback: float, seed: typing.Dict[int, float]) -> None:
+        self.weights = weights
+        self.fallback = fallback
+        self.seed = seed
+
+    def forecast_hour(self, get: typing.Callable[[int], float], target: int) -> float:
+        raw = forecast.features_for(get, target)
+        if not forecast.usable(raw):
+            return self.fallback
+        return forecast.predict_row(self.weights, forecast.impute(raw, self.fallback))
 
     def predict(self, context, model_input=None, params=None):
-        # The pyfunc signature carries a context when MLflow calls it and not when the
-        # model is called directly, so the payload is taken from whichever argument
-        # holds it.
+        # The pyfunc signature carries a context when MLflow calls it and not when
+        # the model is called directly, so the payload is taken from whichever
+        # argument holds it.
         payload = model_input if model_input is not None else context
-        value = float(payload.get("value", 0.0))
-        return value - self.baseline
+        history = {int(k): float(v) for k, v in payload.get("history", {}).items()}
+        target = int(payload["target_hour"])
+        return self.forecast_hour(lambda h: history.get(h, math.nan), target)
 
 
 @ray.remote
-def _fit(datasets: typing.List[typing.Any]) -> float:
-    """The distributed part. Replace the body; keep the shape.
+def _fit(datasets: typing.List[typing.Any]) -> typing.Dict[str, typing.Any]:
+    """The distributed part: hourly means, then the fit."""
+    import pandas as pd
 
-    A Ray task rather than a plain function so that training scales with the
-    cluster rather than with the operator's pod.
-    """
-    total, count = 0.0, 0
+    frames = []
     for dataset in datasets:
-        for batch in dataset.iter_batches(batch_size=4096):
-            values = batch.get("value")
-            if values is None:
-                continue
-            for value in values:
-                if value is None:
-                    continue
-                total += float(value)
-                count += 1
-    return total / count if count else 0.0
+        if isinstance(dataset, ray.ObjectRef):
+            dataset = ray.get(dataset)
+        frame = dataset.to_pandas()
+        if "value" in frame.columns and len(frame):
+            frames.append(frame[["time", "value"]])
+    if not frames:
+        return {}
+    hourly = forecast.hourly_from_frame(pd.concat(frames, ignore_index=True))
+    weights, fallback, metrics = forecast.fit(hourly)
+    newest = max(hourly)
+    seed = {h: v for h, v in hourly.items() if h > newest - forecast.SEED_HOURS}
+    return {
+        "weights": weights,
+        "fallback": fallback,
+        "metrics": metrics,
+        "seed": seed,
+        "hours": len(hourly),
+        "newest_hour": newest,
+    }
 
 
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
@@ -71,8 +96,18 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         return None
 
     with logger.trace("fit"):
-        baseline = ray.get(_fit.remote(datasets))
+        result = ray.get(_fit.remote(datasets))
+    if not result:
+        return None
 
-    logger.log_params({"training_window_days": TRAINING_WINDOW.days})
-    logger.log_metrics({"baseline": baseline})
-    return OdeAblationLoadL2Model(baseline=baseline)
+    logger.log_params({
+        "training_window_days": TRAINING_WINDOW.days,
+        "horizon_h": forecast.HORIZON_H,
+        "features": ",".join(forecast.FEATURES),
+        "hourly_buckets": result["hours"],
+        "newest_training_hour": datetime.datetime.fromtimestamp(
+            result["newest_hour"] * 3600, tz=datetime.timezone.utc).isoformat(),
+    })
+    logger.log_metrics(result["metrics"])
+    return OdeAblationLoadL2Model(
+        weights=result["weights"], fallback=result["fallback"], seed=result["seed"])
