@@ -23,12 +23,11 @@ from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
 import forecast
 
 
-# How much history one training pass reads. 120 days rather than a year, so the
-# weights are fitted on the regime the forecast is used in: a year is dominated by
-# winter's higher, heating-driven load, whose dynamics differ from summer and
-# autumn. The first 14 days of the window only feed lags, so about 106 days of
-# targets remain, of which the newest 28 are the holdout.
-TRAINING_WINDOW = datetime.timedelta(days=120)
+# How much history one training pass reads. A year, so the lag weights see every
+# season. Measured against 120 days (run 02ad681): the year was marginally better
+# on both the August holdout (232.6 W vs 236.8 W) and September (220.0 W vs
+# 221.0 W), so the weights gain nothing from being fitted on recent weeks only.
+TRAINING_WINDOW = datetime.timedelta(days=365)
 
 
 class OdeAblationLoadL2Model(PythonModel):
